@@ -1,0 +1,12 @@
+[package]
+name = "verifier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hydra-toolkit = { path = "../hydra-toolkit" }
+anyhow = "1.0.62"
+tokio = { version = "1", features = ["full"] }
+rayon = "1.11.0"
+chrono = { version = "0.4", features = ["serde"] }
+k256 = { version = "0.13", features = ["ecdsa", "ecdh", "sha256"] }

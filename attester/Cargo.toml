@@ -1,0 +1,22 @@
+[package]
+name = "attester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hydra-toolkit = { path = "../hydra-toolkit" }
+anyhow = "1.0.62"
+tokio = { version = "1", features = ["full"] }
+hex = "0.4"
+ark-bls12-381 = "0.3.0"
+ark-crypto-primitives = "0.3.0"
+ark-groth16 = "0.3.0"
+ark-r1cs-std = { version = "^0.3.0", default-features = false }
+ark-relations = { version = "^0.3.0", default-features = false }
+ark-serialize = "0.3.0"
+arkworks-native-gadgets = { version = "1.2.0", default-features = false }
+arkworks-r1cs-gadgets = { version = "1.2.0", default-features = false }
+ecdsa = "0.16"
+k256 = { version = "0.13", features = ["ecdsa", "ecdh", "sha256"] }
+num-bigint = "0.4.6"
+rand_core = { version = "0.6", features = ["std"] }

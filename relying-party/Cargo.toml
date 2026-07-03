@@ -1,0 +1,16 @@
+[package]
+name = "relying-party"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hydra-toolkit = { path = "../hydra-toolkit" }
+anyhow = "1.0.62"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+ark-bls12-381 = "0.3.0"
+ark-crypto-primitives = "0.3.0"
+ark-groth16 = "0.3.0"
+ark-serialize = "0.3.0"
+k256 = { version = "0.13", features = ["ecdsa", "ecdh", "sha256"] }
+hex = "0.4"

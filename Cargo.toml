@@ -1,0 +1,13 @@
+
+[workspace]
+members = [
+    "attester",
+    "verifier",
+    "relying-party",
+    "hydra-toolkit",
+]
+resolver = "3"
+
+
+
+[workspace.dependencies]
