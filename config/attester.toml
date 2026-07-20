@@ -1,0 +1,4 @@
+listen = "127.0.0.1:9000"
+tee_type = "mock"
+wasm_component_path = "target/wasm32-wasip1/release/mock_appraiser.wasm"
+# verifier_endpoint = "127.0.0.1:8080"  # optional, only needed for passport mode

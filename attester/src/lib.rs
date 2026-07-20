@@ -22,17 +22,29 @@ use std::time::Duration;
 
 type GrothSetup = Groth16<Bls12_381>;
 
+/// Assembled device config: combines DeviceClientInfor (attester side) with
+/// ResponseDeviceInfor (verifier side). Feeds directly into the Groth16 circuit.
 #[derive(Debug)]
 pub struct DeviceConfigInfor {
+    /// Attester secp256k1 signing key (kept private, signs the EvidenceReply)
     pub signing_key: SigningKey<Secp256k1>,
+    /// Attester secp256k1 public key
     pub verifying_key: VerifyingKey<Secp256k1>,
+    /// Device measurement (ar) as field element
     pub measured_value: BlsScalar,
+    /// Verifier response timestamp
     pub timestamp: Duration,
+    /// Verifier response validity window
     pub period: Duration,
+    /// Shrubs leaf: H(H(ar, sk), pk)
     pub merkle_leaf: BlsScalar,
+    /// Merkle proof path (None if leaf is a root itself)
     pub merkle_path: Option<Vec<BlsScalar>>,
+    /// Merkle proof direction tags: true = right, false = left
     pub merkle_tag: Option<Vec<bool>>,
+    /// H(H(H(pk, ar), time), period) — committed value verified by the circuit
     pub authorized_infor: BlsScalar,
+    /// Verifier authorization signature over (pk, authorized_infor, time, period)
     pub signature: Option<Signature>,
 }
 
@@ -49,9 +61,7 @@ impl DeviceConfigInfor {
         let ar = BlsScalar::from(BigUint::from_bytes_be(dev_cli.measured_value.as_bytes()));
         let time = BlsScalar::from(dec_res.timestamp.as_secs());
         let peri = BlsScalar::from(dec_res.period.as_secs());
-        let leaf = dev_cli
-            .merkle_leaf
-            .expect("passport mode requires merkle_leaf");
+        let leaf = dev_cli.merkle_leaf;
         let output = generate_verifier_authoried_infor(ar, pk, time, peri, hasher);
 
         DeviceConfigInfor {
@@ -371,6 +381,9 @@ fn read_verifying_key(cursor: &mut Cursor<&[u8]>) -> Result<VerifyingKey<Secp256
         .context("deserialize secp256k1 public key failed")
 }
 
+/// Persist a DeviceConfigInfor to a binary file. The binary format is self-delimited
+/// (length-prefixed fields) so it can be read back without schema versioning.
+/// Caller must ensure the parent directory exists.
 pub fn save_device_config_infor(path: impl AsRef<Path>, value: &DeviceConfigInfor) -> Result<()> {
     ensure_parent_dir(path.as_ref())?;
     let mut out = Vec::new();
@@ -387,6 +400,9 @@ pub fn save_device_config_infor(path: impl AsRef<Path>, value: &DeviceConfigInfo
     fs::write(path, out).context("save DeviceConfigInfor failed")
 }
 
+/// Deserialize a DeviceConfigInfor from the binary format written by
+/// `save_device_config_infor`. Returns an error if the file is missing,
+/// truncated, or contains invalid cryptographic material.
 pub fn load_device_config_infor(path: impl AsRef<Path>) -> Result<DeviceConfigInfor> {
     let bytes = fs::read(path).context("read DeviceConfigInfor failed")?;
     let mut cursor = Cursor::new(bytes.as_slice());
@@ -413,17 +429,15 @@ pub fn load_device_config_infor(path: impl AsRef<Path>) -> Result<DeviceConfigIn
     })
 }
 
-pub fn generate_device_evidence(
-    root: &[BlsScalar],
-    device_key: &KeyInfor,
-    device_client_infor: &DeviceClientInfor,
-    device_resp: &ResponseDeviceInfor,
-    hasher: &Poseidon<BlsScalar>,
-) -> (EvidenceReply, Signature) {
-    let dev_config = DeviceConfigInfor::new(device_key, device_client_infor, device_resp, hasher);
-    generate_device_evidence_from_config(root, &dev_config, hasher)
-}
-
+/// Build a Groth16 proof from DeviceConfigInfor and wrap it into an EvidenceReply.
+///
+/// Steps:
+/// 1. Assemble AttestationCircuit (pk, sk, ar, time, period, output, root, path, tag)
+/// 2. Run circuit_specific_setup + Groth16::prove → proof + vk
+/// 3. Construct EvidenceReply with verifier sig, attester pk, timestamps, authorized_infor
+/// 4. Sign the whole EvidenceReply with attester signing key → attester signature
+///
+/// Returns (EvidenceReply, attester_signature). The caller sends both to relying-party.
 pub fn generate_device_evidence_from_config(
     root: &[BlsScalar],
     dev_config: &DeviceConfigInfor,

@@ -1,0 +1,26 @@
+listen = "127.0.0.1:8080"
+
+[wasm]
+allow_unsigned = false
+registry_dir = "data/components"
+trusted_component_hashes = [
+  # cca_hydra_appraiser.wasm
+  "f0b32274b6a4301ea5563236fa60c0370a98343c1befadcb794a3ffda8b96433",
+]
+
+
+[ear]
+# CCA + hydra dual-layer policy. Evidence is rejected if either layer fails.
+# trusted_subjects is currently empty (appraiser does not yet parse CCA token internal subject);
+# trusted_roots_hex source: cargo run -p hydra --example shrubs_roots
+# trusted_subjects is currently empty (appraiser does not yet parse CCA token internal subject);
+# trusted_roots_hex source: cargo run -p hydra --example shrubs_roots
+[policy.cca]
+trusted_subjects = []
+
+[policy.hydra]
+trusted_roots_hex = [
+  "24ad36ee559e14bd5696a38a257fce71a0db629c1b30058c43e11239a8f2e109",
+  "df0bcf2b96d94278b119985e07cfa897b1a2702a6ff51c50c2e1a27e7a0bfe19",
+  "ff3cfdb72b8593831f3c0619a255be205467dd2755827fb92bdd6185873c2f0d",
+]

@@ -1,0 +1,33 @@
+listen = "127.0.0.1:9000"
+tee_type = "csv-hydra"
+wasm_component_path = "target/wasm32-wasip1/release/csv_hydra_appraiser.wasm"
+aa_endpoint = "http://127.0.0.1:8006"
+verifier_endpoint = "127.0.0.1:8080"  # hydra paths require passport mode
+
+# Must match [policy.hydra] in verifier-csv-hydra.toml: device list corresponds to trusted_roots_hex.
+[zk]
+proving_key_path = "config/hydra-shrubs/attestation_pk.bin"
+verifying_key_path = "config/hydra-shrubs/attestation_vk.bin"
+
+[zk.whitelist]
+self_index = 0
+
+[[zk.whitelist.devices]]
+pk = 100
+sk = 200
+ar = 300
+
+[[zk.whitelist.devices]]
+pk = 101
+sk = 201
+ar = 301
+
+[[zk.whitelist.devices]]
+pk = 102
+sk = 202
+ar = 302
+
+[[zk.whitelist.devices]]
+pk = 103
+sk = 203
+ar = 303

@@ -1,0 +1,24 @@
+listen = "127.0.0.1:8080"
+
+[wasm]
+allow_unsigned = false
+registry_dir = "data/components"
+trusted_component_hashes = [
+  # csv_appraiser.wasm
+  "e4062a2e6cb7063c802e07e9e5eeb70e55b313f0c6251c1246ad42524499e7e3",
+]
+
+[ear]
+signing_key_path = "config/keys/ear_signing.pem"
+
+# Hygon CSV: host-side csv-rs chain verification + chip_id whitelist.
+# Hygon CSV: host-side csv-rs chain verification + chip_id whitelist.
+# enabled=false skips verification entirely (demo/debug only; must be true in production).
+enabled = true
+# HSK/CEK offline cache directory; when evidence has no hsk_cek, looks up <cert_dir>/hsk_cek/<chip_id>/hsk_cek.cert.
+# Empty string defaults to /opt/hygon/csv.
+# cert_dir = "/opt/hygon/csv"
+# Whether to fetch from KDS online when offline cache misses (https://cert.hygon.cn/hsk_cek?snumber=<chip>).
+allow_kds_fetch = false
+# chip_id whitelist (serial_number text). Empty = no chip whitelist enforcement.
+trusted_chip_ids = []

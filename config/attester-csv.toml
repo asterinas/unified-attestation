@@ -1,0 +1,5 @@
+listen = "127.0.0.1:9000"
+tee_type = "csv"
+wasm_component_path = "target/wasm32-wasip1/release/csv_appraiser.wasm"
+aa_endpoint = "http://127.0.0.1:8006"
+# verifier_endpoint = "127.0.0.1:8080"  # optional, only needed for passport mode

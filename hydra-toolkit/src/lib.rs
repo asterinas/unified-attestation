@@ -1,5 +1,4 @@
-﻿pub mod device_vc;
-pub mod poseidon;
+﻿pub mod poseidon;
 pub mod shurbstree;
 
 use aes_gcm::{
@@ -11,7 +10,6 @@ use ark_bls12_381::Bls12_381;
 pub use ark_bls12_381::Fr as BlsScalar;
 use ark_groth16::{Proof, VerifyingKey as ArkVerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
-use ark_std::UniformRand;
 use arkworks_native_gadgets::poseidon::FieldHasher;
 pub use arkworks_native_gadgets::poseidon::Poseidon;
 use ecdsa::{SigningKey, VerifyingKey};
@@ -23,7 +21,6 @@ use k256::ecdsa::{
 use k256::{PublicKey, Secp256k1, sha2::Sha256};
 use num_bigint::BigUint;
 use rand_core::{OsRng, RngCore};
-use rayon::prelude::*;
 use shurbstree::{exponents_of_two, find_interval_index, find_shrubs_path, insert_shrubs_tree};
 use std::fs;
 use std::io::Cursor;
@@ -45,7 +42,6 @@ pub const DEFAULT_VERIFIER_ADDR: &str = "127.0.0.1:7001";
 pub const DEFAULT_RELYING_PARTY_ADDR: &str = "127.0.0.1:7002";
 pub const MAX_TCP_FRAME_LEN: u64 = 512 * 1024 * 1024;
 pub const MSG_DEVICE_INFOR: &[u8; 4] = b"DINF";
-pub const MSG_RELYING_PARTY_DEVICE_INFOR: &[u8; 4] = b"RDIN";
 pub const MSG_PUBLIC_CONTEXT: &[u8; 4] = b"PUBC";
 pub const MSG_EVIDENCE: &[u8; 4] = b"EVID";
 pub const EVIDENCE_REPLY_ATTESTER_PERIOD_SECS: u64 = 2 * 60;
@@ -54,18 +50,7 @@ pub fn project_root_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-pub fn workspace_data_dir() -> PathBuf {
-    project_root_dir().join(DATA_DIR_NAME)
-}
-
-pub fn workspace_data_file(name: &str) -> PathBuf {
-    workspace_data_dir().join(name)
-}
-
-pub fn ensure_workspace_data_dir() -> Result<()> {
-    fs::create_dir_all(workspace_data_dir()).context("create workspace-data directory failed")
-}
-
+/// Create all parent directories for a given path if they don't already exist.
 fn ensure_parent_dir(path: impl AsRef<Path>) -> Result<()> {
     if let Some(parent) = path.as_ref().parent() {
         fs::create_dir_all(parent).context("create parent directory failed")?;
@@ -73,30 +58,54 @@ fn ensure_parent_dir(path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+/// Read the device measurement file. Panics if `example.txt` is absent — measurement
+/// is mandatory for hydra sessions; the attester cannot participate without it.
 pub fn read_measurement_file() -> String {
     fs::read_to_string(project_root_dir().join("example.txt"))
         .expect("read measurement file failed")
 }
 
-fn generate_evidence_cmw_json() -> Vec<u8> {
-    Vec::new()
-}
-
+/// Default Poseidon hasher for BLS12-381 (width=3, exp=5).
+/// Width-3 2-to-1 compression matches both the shrubs accumulator and the
+/// authorization commitment `H(H(H(pk,ar),time),period)`. Changing parameters
+/// would break hash compatibility between prover and verifier.
 pub fn default_hasher() -> Poseidon<BlsScalar> {
     crate::poseidon::poseidon_setup(arkworks_utils::Curve::Bls381, 5, 3)
 }
 
+/// Groth16 evidence bundle sent from attester to relying-party.
+///
+/// Fields:
+/// - `proof`, `vk` — Groth16 proof and verifying key (BLS12-381)
+/// - `sig` — verifier authorization signature over (pk, authorized_infor, timestamp, period)
+/// - `pk` — attester secp256k1 public key
+/// - `timestamp`, `period` — verifier response time window
+/// - `authorized_infor` — `H(H(H(pk, ar), time), period)`, binding device measurement to time
+/// - `timestamp_attester`, `period_attester` — attester-side freshness window
+/// - `proof_timestamp_period_signature` — attester sig over (proof, timestamp_attester, period_attester)
+///
+/// Verification on RP: verify attester sig → verify verifier sig → Groth16::verify.
 #[derive(Debug)]
 pub struct EvidenceReply {
+    /// Groth16 proof over BLS12-381 (proves device in whitelist without revealing index)
     pub proof: Proof<Bls12_381>,
+    /// Groth16 verifying key (generated per-proof via circuit_specific_setup)
     pub vk: ArkVerifyingKey<Bls12_381>,
+    /// Verifier authorization signature: sign(pk || authorized_infor || timestamp || period)
     pub sig: Signature,
+    /// Attester secp256k1 public key
     pub pk: VerifyingKey<Secp256k1>,
+    /// Verifier response timestamp (start of validity window)
     pub timestamp: Duration,
+    /// Verifier response period (validity window length)
     pub period: Duration,
+    /// H(H(H(pk, ar), time), period) — binds device measurement to time
     pub authorized_infor: BlsScalar,
+    /// Attester-side timestamp when EvidenceReply was generated
     pub timestamp_attester: Duration,
+    /// Attester-side freshness window (default 120s)
     pub period_attester: Duration,
+    /// Attester signature over (proof, timestamp_attester, period_attester) — proves freshness
     pub proof_timestamp_period_signature: Signature,
 }
 
@@ -134,14 +143,21 @@ impl EvidenceReply {
             proof_timestamp_period_signature,
         }
     }
+    /// Build public inputs in the exact order expected by the Groth16 circuit:
+    /// `[pk, root[0..N], authorized_infor, timestamp, period]`
     pub fn gen_public_inputs(&self, root: &[BlsScalar]) -> Vec<BlsScalar> {
         let mut public_inputs = vec![];
+        // [0] attester public key (Fr)
         public_inputs.push(BlsScalar::from(BigUint::from_bytes_be(
             self.pk.to_encoded_point(true).as_bytes(),
         )));
-        public_inputs.extend_from_slice(&root);
+        // [1..1+N] shrubs accumulator root list (one Fr per root)
+        public_inputs.extend_from_slice(root);
+        // [1+N] authorized_infor = H(H(H(pk, ar), time), period)
         public_inputs.push(self.authorized_infor);
+        // [2+N] verifier response timestamp (seconds)
         public_inputs.push(BlsScalar::from(self.timestamp.as_secs()));
+        // [3+N] verifier response period (seconds)
         public_inputs.push(BlsScalar::from(self.period.as_secs()));
 
         public_inputs
@@ -249,12 +265,16 @@ fn serialize_duration(duration: &Duration) -> Vec<u8> {
     bytes
 }
 
+/// Current wall-clock time as a `Duration` since UNIX_EPOCH.
+/// Errors only if the system clock is set before 1970.
 pub fn current_unix_duration() -> Result<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time is before UNIX_EPOCH")
 }
 
+/// Reject a DeviceClientInfor whose timestamp+period has already expired.
+/// Called by the verifier before queuing an attester into the batch pipeline.
 pub fn verify_device_client_infor_freshness(value: &DeviceClientInfor) -> Result<()> {
     let expires_at = value
         .timestamp
@@ -273,82 +293,54 @@ pub fn verify_device_client_infor_freshness(value: &DeviceClientInfor) -> Result
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Model {
-    Passport,
-    BackgroundCheck,
-}
-
-impl Model {
-    pub fn from_arg(value: &str) -> Result<Self> {
-        match value {
-            "passport" => Ok(Self::Passport),
-            "background_check" | "background-check" => Ok(Self::BackgroundCheck),
-            other => bail!("unknown mode: {other}; expected passport or background_check"),
-        }
-    }
-}
-
+/// Device identity submitted by attester to the verifier TCP daemon.
 #[derive(Debug, Clone)]
 pub struct DeviceClientInfor {
-    pub mode: Model,
+    /// Attester secp256k1 public key (used for ECDH encryption of verifier response)
     pub verifying_key: VerifyingKey<Secp256k1>,
+    /// Local measurement string (read from example.txt at startup)
     pub measured_value: String,
-    pub merkle_leaf: Option<BlsScalar>,
+    /// H(H(ar, sk), pk) — leaf inserted into the shrubs accumulator
+    pub merkle_leaf: BlsScalar,
+    /// Submission timestamp (for freshness check)
     pub timestamp: Duration,
+    /// Validity window; expired submissions are rejected
     pub period: Duration,
-    pub evidence_cmw_json: Vec<u8>,
 }
 impl DeviceClientInfor {
     pub fn new(vk: VerifyingKey<Secp256k1>, leaf: BlsScalar) -> DeviceClientInfor {
-        Self::new_with_mode(Model::Passport, vk, Some(leaf))
-    }
-
-    pub fn new_with_mode(
-        mode: Model,
-        vk: VerifyingKey<Secp256k1>,
-        leaf: Option<BlsScalar>,
-    ) -> DeviceClientInfor {
         let measure = read_measurement_file();
-        let merkle_leaf = match mode {
-            Model::Passport => leaf,
-            Model::BackgroundCheck => None,
-        };
         let timestamp = current_unix_duration().expect("system time is before UNIX_EPOCH");
-        let period = Duration::from_secs(8640000 as u64);
+        let period = Duration::from_secs(8640000);
         DeviceClientInfor {
-            mode,
             verifying_key: vk,
-            merkle_leaf,
+            merkle_leaf: leaf,
             measured_value: measure,
             timestamp,
             period,
-            evidence_cmw_json: generate_evidence_cmw_json(),
         }
     }
 }
 
+/// Wire-format DeviceClientInfor: fields that are native types in memory
+/// (VerifyingKey, BlsScalar) are serialized to `Vec<u8>` for TCP transport.
 pub struct DeviceClientInforWire {
-    pub mode: Model,
     pub verifying_key: Vec<u8>,
     pub measured_value: String,
-    pub merkle_leaf: Option<Vec<u8>>,
+    pub merkle_leaf: Vec<u8>,
     pub timestamp: Duration,
     pub period: Duration,
-    pub evidence_cmw_json: Vec<u8>,
 }
 
+/// Signed wrapper for `DeviceClientInforWire`. The attester signs the serialized
+/// device info to prove it generated this submission.
 pub struct SignedDeviceClientInforWire {
     pub device: DeviceClientInforWire,
     pub signature: Vec<u8>,
 }
 
-pub struct RelyingPartySignedDeviceClientInforWire {
-    pub signed_device: SignedDeviceClientInforWire,
-    pub relying_party_verifying_key: Vec<u8>,
-    pub relying_party_signature: Vec<u8>,
-}
-
+/// ECIES-like encrypted message: ephemeral pubkey + AES-256-GCM nonce + ciphertext.
+/// Key derivation: ECDH(ephemeral_sk, recipient_pk) → HKDF → AES key.
 pub struct EncryptedMessage {
     pub ephemeral_public_key: Vec<u8>,
     pub nonce: Vec<u8>,
@@ -361,30 +353,21 @@ pub fn find_device_shrubs_path_tag(
     leaf: &BlsScalar,
     hasher: &Poseidon<BlsScalar>,
 ) -> (Option<Vec<BlsScalar>>, Option<Vec<bool>>) {
-    match find_interval_index(&leaves, &leaf) {
+    match find_interval_index(leaves, leaf) {
         Some((vect, index)) => {
             let inx = 0;
 
-            match find_shrubs_path(&root, &vect, inx, index, hasher) {
-                Some((path, tag)) => {
-                    // for i in path.iter() {
-                    //     println!("path: {}", i);
-                    // }
-
-                    (Some(path), Some(tag))
-                }
-
+            match find_shrubs_path(root, &vect, inx, index, hasher) {
+                Some((path, tag)) => (Some(path), Some(tag)),
                 None => (None, None),
             }
         }
 
-        None => {
-            println!("110");
-            (None, None)
-        }
+        None => (None, None),
     }
 }
 
+/// secp256k1 key pair used by attester and verifier for signing/verification.
 pub struct KeyInfor {
     pub signing_key: SigningKey<Secp256k1>,
     pub verifying_key: VerifyingKey<Secp256k1>,
@@ -401,6 +384,14 @@ impl KeyInfor {
     }
 }
 
+impl Default for KeyInfor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute the shrubs Merkle leaf: `leaf = H(H(ar, sk), pk)`.
+/// `ar` is read from the measurement file; `sk`/`pk` from the device key.
 pub fn generate_device_merkle_leaf(
     device_key: &KeyInfor,
     hasher: &Poseidon<BlsScalar>,
@@ -410,18 +401,17 @@ pub fn generate_device_merkle_leaf(
         &device_key.signing_key.to_bytes()[..],
     ));
     let pk = BlsScalar::from(BigUint::from_bytes_be(
-        &device_key.verifying_key.to_encoded_point(true).as_bytes(),
+        device_key.verifying_key.to_encoded_point(true).as_bytes(),
     ));
     let ar = BlsScalar::from(BigUint::from_bytes_be(measure.as_bytes()));
 
     let c = hasher.hash(&[ar, sk][..]).unwrap();
-    let leaf = hasher.hash(&[c, pk][..]).unwrap();
-
-    leaf
+    hasher.hash(&[c, pk][..]).unwrap()
 }
+/// Verifier response carrying authorization signature, shrubs path/tag, and time window.
+/// Sent encrypted (AES-GCM + ECDH) to attester; fields are fed into DeviceConfigInfor.
 #[derive(Clone)]
 pub struct ResponseDeviceInfor {
-    pub mode: Model,
     pub verifying_key: VerifyingKey<Secp256k1>,
     pub attester_addr: String,
     pub timestamp: Duration,
@@ -433,16 +423,11 @@ pub struct ResponseDeviceInfor {
 
 impl ResponseDeviceInfor {
     pub fn new(pk: VerifyingKey<Secp256k1>) -> ResponseDeviceInfor {
-        Self::new_with_mode(Model::Passport, pk)
-    }
-
-    pub fn new_with_mode(mode: Model, pk: VerifyingKey<Secp256k1>) -> ResponseDeviceInfor {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time failed");
-        let period = Duration::from_secs(8640000 as u64);
+        let period = Duration::from_secs(8640000);
         ResponseDeviceInfor {
-            mode,
             attester_addr: String::new(),
             timestamp,
             period,
@@ -455,15 +440,9 @@ impl ResponseDeviceInfor {
     pub fn set_signature(&mut self, sig: &Signature) {
         self.sig = Some(*sig);
     }
-
-    pub fn set_shrubs_path_and_tag(&mut self, path: Vec<BlsScalar>, tag: Vec<bool>) {
-        self.shrubs_path = Some(path);
-        self.shrubs_tag = Some(tag);
-    }
 }
 
 pub struct ResponseDeviceInforWire {
-    pub mode: Model,
     pub verifying_key: Vec<u8>,
     pub attester_addr: String,
     pub timestamp: Duration,
@@ -492,9 +471,7 @@ pub fn generate_device_authoried_infor(
 
     let temp_1 = hasher.hash(&[pk, ar][..]).unwrap();
     let temp_2 = hasher.hash(&[temp_1, time][..]).unwrap();
-    let output = hasher.hash(&[temp_2, peri][..]).unwrap();
-
-    output
+    hasher.hash(&[temp_2, peri][..]).unwrap()
 }
 
 pub fn generate_verifier_authoried_infor(
@@ -506,13 +483,11 @@ pub fn generate_verifier_authoried_infor(
 ) -> BlsScalar {
     let temp_1 = hasher.hash(&[pk, ar][..]).unwrap();
     let temp_2 = hasher.hash(&[temp_1, time][..]).unwrap();
-    let output = hasher.hash(&[temp_2, peri][..]).unwrap();
-
-    output
+    hasher.hash(&[temp_2, peri][..]).unwrap()
 }
 
 pub fn insert_batch_devices(
-    mut root: &mut Vec<BlsScalar>,
+    root: &mut Vec<BlsScalar>,
     old_leaves: &[BlsScalar],
     new_leaves: &mut Vec<BlsScalar>,
     hasher: &Poseidon<BlsScalar>,
@@ -527,51 +502,38 @@ pub fn insert_batch_devices(
         n_leaf.push(root[0]);
         n_leaf.append(new_leaves);
 
-        insert_shrubs_tree(&mut root, &n_leaf, k, &exps, ll + 1, &hasher);
+        insert_shrubs_tree(root, &n_leaf, k, &exps, ll + 1, hasher);
     } else {
-        insert_shrubs_tree(&mut root, &new_leaves, k, &exps, ll, &hasher);
+        insert_shrubs_tree(root, new_leaves, k, &exps, ll, hasher);
     }
 }
+/// Build a DeviceClientInfor from a key pair: computes the merkle leaf
+/// `H(H(ar, sk), pk)`, reads the measurement file, stamps the current time.
+/// This is the first step in the attester's hydra submission flow.
 pub fn generate_device_client_infor(
     device_key: &KeyInfor,
     hasher: &Poseidon<BlsScalar>,
 ) -> DeviceClientInfor {
-    generate_device_client_infor_with_mode(device_key, hasher, Model::Passport)
+    let device_leaf = generate_device_merkle_leaf(device_key, hasher);
+    DeviceClientInfor::new(device_key.verifying_key, device_leaf)
 }
 
-pub fn generate_device_client_infor_with_mode(
-    device_key: &KeyInfor,
-    hasher: &Poseidon<BlsScalar>,
-    mode: Model,
-) -> DeviceClientInfor {
-    let device_leaf = match mode {
-        Model::Passport => Some(generate_device_merkle_leaf(device_key, hasher)),
-        Model::BackgroundCheck => None,
-    };
-    DeviceClientInfor::new_with_mode(mode, device_key.verifying_key, device_leaf)
-}
-
-pub fn gen_leaves() -> Vec<BlsScalar> {
-    let n = 1usize << 11;
-    (0..n - 1)
-        .into_par_iter()
-        .map_init(|| OsRng, |rng, _| BlsScalar::rand(rng))
-        .collect()
-}
-
-pub fn gen_new_leaves() -> Vec<BlsScalar> {
-    let n = 1usize << 12;
-    (0..n - 1)
-        .into_par_iter()
-        .map_init(|| OsRng, |rng, _| BlsScalar::rand(rng))
-        .collect()
-}
-
+/// Global public state broadcast by verifier on every batch completion.
 #[derive(Debug, Clone)]
 pub struct PublicContext {
+    /// Current shrubs accumulator root list (one Fr per root)
     pub root: Vec<BlsScalar>,
+    /// Verifier secp256k1 public key — RP uses this to verify authorization signatures
     pub verifier_pk: VerifyingKey<Secp256k1>,
 }
+
+// ---- Wire codec helpers -------------------------------------------------------
+// The following encode_*/decode_* pairs convert between native Rust types and
+// length-prefixed binary blobs for TCP transport and on-disk persistence.
+// All scalar types (BlsScalar, Signature, VerifyingKey) are serialized via
+// ark-serialize (uncompressed) or k256 DER encoding. Durations are 12-byte
+// (u64 seconds + u32 nanoseconds). Vectors are u64-length-prefixed.
+// Every encode_* has a matching decode_* that inverts it exactly.
 
 fn append_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
@@ -595,7 +557,6 @@ fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
 fn read_len_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>> {
     let len = read_u64(cursor)? as usize;
     let mut bytes = vec![0u8; len];
-    // cursor.read_exact(&mut bytes).context("read length-prefixed bytes failed")?;
     std::io::Read::read_exact(cursor, &mut bytes).context("read length-prefixed bytes failed")?;
     Ok(bytes)
 }
@@ -606,21 +567,6 @@ fn append_string(out: &mut Vec<u8>, value: &str) {
 
 fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     String::from_utf8(read_len_bytes(cursor)?).context("parse UTF-8 string failed")
-}
-
-fn append_model(out: &mut Vec<u8>, value: Model) {
-    out.push(match value {
-        Model::Passport => 0,
-        Model::BackgroundCheck => 1,
-    });
-}
-
-fn read_model(cursor: &mut Cursor<&[u8]>) -> Result<Model> {
-    match read_exact::<1>(cursor)?[0] {
-        0 => Ok(Model::Passport),
-        1 => Ok(Model::BackgroundCheck),
-        other => bail!("Model tag is invalid: {}", other),
-    }
 }
 
 fn append_duration(out: &mut Vec<u8>, value: Duration) {
@@ -738,50 +684,27 @@ fn read_verifying_key(cursor: &mut Cursor<&[u8]>) -> Result<VerifyingKey<Secp256
 }
 
 pub fn device_client_infor_to_wire(value: &DeviceClientInfor) -> Result<DeviceClientInforWire> {
-    let merkle_leaf = match value.mode {
-        Model::Passport => Some(encode_scalar(
-            value
-                .merkle_leaf
-                .as_ref()
-                .context("passport mode requires merkle_leaf")?,
-        )?),
-        Model::BackgroundCheck => None,
-    };
-
     Ok(DeviceClientInforWire {
-        mode: value.mode,
         verifying_key: value
             .verifying_key
             .to_encoded_point(true)
             .as_bytes()
             .to_vec(),
         measured_value: value.measured_value.clone(),
-        merkle_leaf,
+        merkle_leaf: encode_scalar(&value.merkle_leaf)?,
         timestamp: value.timestamp,
         period: value.period,
-        evidence_cmw_json: value.evidence_cmw_json.clone(),
     })
 }
 
 pub fn device_client_infor_from_wire(wire: &DeviceClientInforWire) -> Result<DeviceClientInfor> {
-    let merkle_leaf = match wire.mode {
-        Model::Passport => Some(decode_scalar(
-            wire.merkle_leaf
-                .as_deref()
-                .context("passport mode requires merkle_leaf")?,
-        )?),
-        Model::BackgroundCheck => None,
-    };
-
     Ok(DeviceClientInfor {
-        mode: wire.mode,
         verifying_key: VerifyingKey::<Secp256k1>::from_sec1_bytes(&wire.verifying_key)
             .context("decode DeviceClientInforWire verifying_key failed")?,
         measured_value: wire.measured_value.clone(),
-        merkle_leaf,
+        merkle_leaf: decode_scalar(&wire.merkle_leaf)?,
         timestamp: wire.timestamp,
         period: wire.period,
-        evidence_cmw_json: wire.evidence_cmw_json.clone(),
     })
 }
 
@@ -814,36 +737,6 @@ pub fn verify_signed_device_client_infor_wire(
     device_client_infor_from_wire(&signed.device)
 }
 
-pub fn sign_relying_party_device_client_infor_to_wire(
-    signed_device: SignedDeviceClientInforWire,
-    relying_party_key: &KeyInfor,
-) -> Result<RelyingPartySignedDeviceClientInforWire> {
-    let message = encode_signed_device_client_infor_wire(&signed_device)?;
-    let signature: Signature = relying_party_key.signing_key.sign(message.as_slice());
-    Ok(RelyingPartySignedDeviceClientInforWire {
-        signed_device,
-        relying_party_verifying_key: relying_party_key
-            .verifying_key
-            .to_encoded_point(true)
-            .as_bytes()
-            .to_vec(),
-        relying_party_signature: encode_signature(&signature),
-    })
-}
-
-pub fn verify_relying_party_signed_device_client_infor_wire(
-    signed: &RelyingPartySignedDeviceClientInforWire,
-) -> Result<()> {
-    let verifying_key =
-        VerifyingKey::<Secp256k1>::from_sec1_bytes(&signed.relying_party_verifying_key)
-            .context("decode relying-party verifying_key failed")?;
-    let signature = decode_signature(&signed.relying_party_signature)?;
-    let message = encode_signed_device_client_infor_wire(&signed.signed_device)?;
-    verifying_key
-        .verify(message.as_slice(), &signature)
-        .context("relying-party DeviceClientInfor signature verification failed")
-}
-
 fn derive_aes_key(shared_secret: &[u8]) -> Result<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut key = [0u8; 32];
@@ -856,15 +749,20 @@ pub fn encrypt_for_device_pubkey(
     plaintext: &[u8],
     device_pubkey: &VerifyingKey<Secp256k1>,
 ) -> Result<EncryptedMessage> {
+    // ECDH key agreement: generate ephemeral keypair, compute shared secret with
+    // the attester's static public key, then derive an AES-256 key via HKDF.
     let recipient_public_key =
         PublicKey::from_sec1_bytes(device_pubkey.to_encoded_point(true).as_bytes())
             .context("decode device public key for encryption failed")?;
     let ephemeral_secret = k256::ecdh::EphemeralSecret::random(&mut OsRng);
     let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public_key);
+    // HKDF the raw ECDH bytes into a fixed-length AES-256 key
     let key = derive_aes_key(shared_secret.raw_secret_bytes().as_slice())?;
-    let cipher = Aes256Gcm::new_from_slice(&key).context("create AES-GCM cipher failed")?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| anyhow::anyhow!("create AES-GCM cipher failed"))?;
 
+    // Fresh random nonce per encryption — reuse would break AES-GCM security
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let ciphertext = cipher
@@ -878,6 +776,9 @@ pub fn encrypt_for_device_pubkey(
     })
 }
 
+/// Reverse of `encrypt_for_device_pubkey`: reconstruct the ECDH shared secret from
+/// the attester's private key and the verifier's ephemeral public key, derive the
+/// same AES key, and decrypt.
 pub fn decrypt_for_device_key(
     encrypted: &EncryptedMessage,
     device_key: &KeyInfor,
@@ -891,7 +792,8 @@ pub fn decrypt_for_device_key(
         ephemeral_public_key.as_affine(),
     );
     let key = derive_aes_key(shared_secret.raw_secret_bytes().as_slice())?;
-    let cipher = Aes256Gcm::new_from_slice(&key).context("create AES-GCM cipher failed")?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| anyhow::anyhow!("create AES-GCM cipher failed"))?;
     cipher
         .decrypt(
             Nonce::from_slice(&encrypted.nonce),
@@ -909,7 +811,6 @@ pub fn response_device_infor_to_wire(
     };
 
     Ok(ResponseDeviceInforWire {
-        mode: value.mode,
         verifying_key: value
             .verifying_key
             .to_encoded_point(true)
@@ -937,7 +838,6 @@ pub fn response_device_infor_from_wire(
     };
 
     Ok(ResponseDeviceInfor {
-        mode: wire.mode,
         verifying_key: VerifyingKey::<Secp256k1>::from_sec1_bytes(&wire.verifying_key)
             .context("decode ResponseDeviceInforWire verifying_key failed")?,
         attester_addr: wire.attester_addr.clone(),
@@ -995,71 +895,28 @@ fn read_ark_vk(cursor: &mut Cursor<&[u8]>) -> Result<ArkVerifyingKey<Bls12_381>>
     decode_ark_vk(&read_len_bytes(cursor)?)
 }
 
-pub fn encode_key_infor(key: &KeyInfor) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    append_len_bytes(&mut out, &key.signing_key.to_bytes()[..]);
-    Ok(out)
-}
-
-pub fn decode_key_infor(bytes: &[u8]) -> Result<KeyInfor> {
-    let mut cursor = Cursor::new(bytes);
-    let sk_bytes = read_len_bytes(&mut cursor)?;
-    if sk_bytes.len() != 32 {
-        bail!(
-            "secp256k1 secret key length must be 32 bytes, got {}",
-            sk_bytes.len()
-        );
-    }
-    let signing_key = SigningKey::<Secp256k1>::from_bytes(k256::FieldBytes::from_slice(&sk_bytes))
-        .context("decode secp256k1 secret key failed")?;
-    let verifying_key = VerifyingKey::from(&signing_key);
-    Ok(KeyInfor {
-        signing_key,
-        verifying_key,
-    })
-}
-
 pub fn encode_device_client_infor(value: &DeviceClientInfor) -> Result<Vec<u8>> {
     encode_device_client_infor_wire(&device_client_infor_to_wire(value)?)
 }
 
 pub fn encode_device_client_infor_wire(value: &DeviceClientInforWire) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    append_model(&mut out, value.mode);
     append_len_bytes(&mut out, &value.verifying_key);
     append_string(&mut out, &value.measured_value);
-    match &value.merkle_leaf {
-        Some(merkle_leaf) => {
-            out.push(1);
-            append_len_bytes(&mut out, merkle_leaf);
-        }
-        None => out.push(0),
-    }
+    append_len_bytes(&mut out, &value.merkle_leaf);
     append_duration(&mut out, value.timestamp);
     append_duration(&mut out, value.period);
-    append_len_bytes(&mut out, &value.evidence_cmw_json);
     Ok(out)
-}
-
-pub fn decode_device_client_infor(bytes: &[u8]) -> Result<DeviceClientInfor> {
-    let wire = decode_device_client_infor_wire(bytes)?;
-    device_client_infor_from_wire(&wire)
 }
 
 pub fn decode_device_client_infor_wire(bytes: &[u8]) -> Result<DeviceClientInforWire> {
     let mut cursor = Cursor::new(bytes);
     Ok(DeviceClientInforWire {
-        mode: read_model(&mut cursor)?,
         verifying_key: read_len_bytes(&mut cursor)?,
         measured_value: read_string(&mut cursor)?,
-        merkle_leaf: match read_exact::<1>(&mut cursor)?[0] {
-            0 => None,
-            1 => Some(read_len_bytes(&mut cursor)?),
-            other => bail!("Option<merkle_leaf> tag invalid: {}", other),
-        },
+        merkle_leaf: read_len_bytes(&mut cursor)?,
         timestamp: read_duration(&mut cursor)?,
         period: read_duration(&mut cursor)?,
-        evidence_cmw_json: read_len_bytes(&mut cursor)?,
     })
 }
 
@@ -1077,33 +934,6 @@ pub fn decode_signed_device_client_infor_wire(bytes: &[u8]) -> Result<SignedDevi
     let device = decode_device_client_infor_wire(&read_len_bytes(&mut cursor)?)?;
     let signature = read_len_bytes(&mut cursor)?;
     Ok(SignedDeviceClientInforWire { device, signature })
-}
-
-pub fn encode_relying_party_signed_device_client_infor_wire(
-    value: &RelyingPartySignedDeviceClientInforWire,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    append_len_bytes(
-        &mut out,
-        &encode_signed_device_client_infor_wire(&value.signed_device)?,
-    );
-    append_len_bytes(&mut out, &value.relying_party_verifying_key);
-    append_len_bytes(&mut out, &value.relying_party_signature);
-    Ok(out)
-}
-
-pub fn decode_relying_party_signed_device_client_infor_wire(
-    bytes: &[u8],
-) -> Result<RelyingPartySignedDeviceClientInforWire> {
-    let mut cursor = Cursor::new(bytes);
-    let signed_device = decode_signed_device_client_infor_wire(&read_len_bytes(&mut cursor)?)?;
-    let relying_party_verifying_key = read_len_bytes(&mut cursor)?;
-    let relying_party_signature = read_len_bytes(&mut cursor)?;
-    Ok(RelyingPartySignedDeviceClientInforWire {
-        signed_device,
-        relying_party_verifying_key,
-        relying_party_signature,
-    })
 }
 
 pub fn encode_encrypted_message(value: &EncryptedMessage) -> Result<Vec<u8>> {
@@ -1129,7 +959,6 @@ pub fn encode_response_device_infor(value: &ResponseDeviceInfor) -> Result<Vec<u
 
 pub fn encode_response_device_infor_wire(value: &ResponseDeviceInforWire) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    append_model(&mut out, value.mode);
     append_len_bytes(&mut out, &value.verifying_key);
     append_string(&mut out, &value.attester_addr);
     append_duration(&mut out, value.timestamp);
@@ -1162,7 +991,6 @@ pub fn decode_response_device_infor(bytes: &[u8]) -> Result<ResponseDeviceInfor>
 
 pub fn decode_response_device_infor_wire(bytes: &[u8]) -> Result<ResponseDeviceInforWire> {
     let mut cursor = Cursor::new(bytes);
-    let mode = read_model(&mut cursor)?;
     let verifying_key = read_len_bytes(&mut cursor)?;
     let attester_addr = read_string(&mut cursor)?;
     let timestamp = read_duration(&mut cursor)?;
@@ -1187,7 +1015,6 @@ pub fn decode_response_device_infor_wire(bytes: &[u8]) -> Result<ResponseDeviceI
     let shrubs_tag = read_option_bool_vec(&mut cursor)?;
 
     Ok(ResponseDeviceInforWire {
-        mode,
         verifying_key,
         attester_addr,
         timestamp,
@@ -1270,6 +1097,9 @@ pub fn decode_verifier_response(bytes: &[u8]) -> Result<(ResponseDeviceInfor, Pu
     ))
 }
 
+/// Serialize ResponseDeviceInfor + PublicContext, then encrypt with attester's pubkey
+/// via ECDH + HKDF → AES-256-GCM. Only the attester holding the corresponding private key
+/// can decrypt.
 pub fn encode_encrypted_verifier_response(
     dev_res: &ResponseDeviceInfor,
     public_context: &PublicContext,
@@ -1280,6 +1110,8 @@ pub fn encode_encrypted_verifier_response(
     encode_encrypted_message(&encrypted)
 }
 
+/// Decrypt and decode the verifier's encrypted response. Returns the pair
+/// (ResponseDeviceInfor, PublicContext) that the attester uses to build DeviceConfigInfor.
 pub fn decode_encrypted_verifier_response(
     bytes: &[u8],
     device_key: &KeyInfor,
@@ -1314,26 +1146,6 @@ pub fn decode_signed_device_client_infor_message(
     decode_signed_device_client_infor_wire(&bytes[MSG_DEVICE_INFOR.len()..])
 }
 
-pub fn encode_relying_party_signed_device_client_infor_message(
-    value: &RelyingPartySignedDeviceClientInforWire,
-) -> Result<Vec<u8>> {
-    Ok(encode_typed_message(
-        MSG_RELYING_PARTY_DEVICE_INFOR,
-        encode_relying_party_signed_device_client_infor_wire(value)?,
-    ))
-}
-
-pub fn decode_relying_party_signed_device_client_infor_message(
-    bytes: &[u8],
-) -> Result<RelyingPartySignedDeviceClientInforWire> {
-    if !bytes.starts_with(MSG_RELYING_PARTY_DEVICE_INFOR) {
-        bail!("not a RelyingPartySignedDeviceClientInfor message");
-    }
-    decode_relying_party_signed_device_client_infor_wire(
-        &bytes[MSG_RELYING_PARTY_DEVICE_INFOR.len()..],
-    )
-}
-
 pub fn encode_public_context_message(public_context: &PublicContext) -> Result<Vec<u8>> {
     Ok(encode_typed_message(
         MSG_PUBLIC_CONTEXT,
@@ -1365,6 +1177,7 @@ pub fn decode_evidence_message(bytes: &[u8]) -> Result<(EvidenceReply, Signature
     decode_evidence_bundle(&bytes[MSG_EVIDENCE.len()..])
 }
 
+/// Write a `[u64 len][payload]` framed message to a TCP stream.
 pub async fn tcp_send_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
     let len = payload.len() as u64;
     stream
@@ -1408,15 +1221,9 @@ pub fn save_key_infor(path: impl AsRef<Path>, key: &KeyInfor) -> Result<()> {
 pub fn load_key_infor(path: impl AsRef<Path>) -> Result<KeyInfor> {
     let bytes = fs::read(path).context("read KeyInfor failed")?;
     let mut cursor = Cursor::new(bytes.as_slice());
-    let sk_bytes = read_len_bytes(&mut cursor)?;
-    if sk_bytes.len() != 32 {
-        bail!(
-            "secp256k1 secret key length must be 32 bytes, got {}",
-            sk_bytes.len()
-        );
-    }
-    let signing_key = SigningKey::<Secp256k1>::from_bytes(k256::FieldBytes::from_slice(&sk_bytes))
-        .context("decode secp256k1 secret key failed")?;
+    let signing_key_bytes = read_len_bytes(&mut cursor)?;
+    let signing_key = SigningKey::<Secp256k1>::from_slice(&signing_key_bytes)
+        .context("deserialize secp256k1 signing key failed")?;
     let verifying_key = VerifyingKey::from(&signing_key);
     Ok(KeyInfor {
         signing_key,
@@ -1430,11 +1237,6 @@ pub fn save_device_client_infor(path: impl AsRef<Path>, value: &DeviceClientInfo
     fs::write(path, out).context("save DeviceClientInfor failed")
 }
 
-pub fn load_device_client_infor(path: impl AsRef<Path>) -> Result<DeviceClientInfor> {
-    let bytes = fs::read(path).context("read DeviceClientInfor failed")?;
-    decode_device_client_infor(&bytes)
-}
-
 pub fn save_response_device_infor(
     path: impl AsRef<Path>,
     value: &ResponseDeviceInfor,
@@ -1442,11 +1244,6 @@ pub fn save_response_device_infor(
     ensure_parent_dir(path.as_ref())?;
     let out = encode_response_device_infor(value)?;
     fs::write(path, out).context("save ResponseDeviceInfor failed")
-}
-
-pub fn load_response_device_infor(path: impl AsRef<Path>) -> Result<ResponseDeviceInfor> {
-    let bytes = fs::read(path).context("read ResponseDeviceInfor failed")?;
-    decode_response_device_infor(&bytes)
 }
 
 pub fn save_public_context(path: impl AsRef<Path>, value: &PublicContext) -> Result<()> {
@@ -1485,23 +1282,4 @@ pub fn save_evidence_bundle(
     append_signature(&mut out, &evidence_reply.proof_timestamp_period_signature);
     append_signature(&mut out, device_signature);
     fs::write(path, out).context("save EvidenceReply and attester signature failed")
-}
-
-pub fn load_evidence_bundle(path: impl AsRef<Path>) -> Result<(EvidenceReply, Signature)> {
-    let bytes = fs::read(path).context("read EvidenceReply and attester signature failed")?;
-    let mut cursor = Cursor::new(bytes.as_slice());
-    let evidence_reply = EvidenceReply {
-        proof: read_proof(&mut cursor)?,
-        vk: read_ark_vk(&mut cursor)?,
-        sig: read_signature(&mut cursor)?,
-        pk: read_verifying_key(&mut cursor)?,
-        timestamp: read_duration(&mut cursor)?,
-        period: read_duration(&mut cursor)?,
-        authorized_infor: read_scalar(&mut cursor)?,
-        timestamp_attester: read_duration(&mut cursor)?,
-        period_attester: read_duration(&mut cursor)?,
-        proof_timestamp_period_signature: read_signature(&mut cursor)?,
-    };
-    let device_signature = read_signature(&mut cursor)?;
-    Ok((evidence_reply, device_signature))
 }

@@ -1,0 +1,19 @@
+[package]
+name = "mock-appraiser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[package.metadata.component]
+package = "unified-attestation:verifier"
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wit-bindgen.workspace = true

@@ -1,0 +1,13 @@
+listen = "127.0.0.1:8080"
+
+[wasm]
+allow_unsigned = true
+registry_dir = "data/components"
+trusted_component_hashes = []
+
+
+[ear]
+signing_key_path = "config/keys/ear_signing.pem"
+
+[policy.cca]
+trusted_subjects = []

@@ -1,0 +1,23 @@
+listen = "127.0.0.1:8080"
+
+[wasm]
+allow_unsigned = false
+registry_dir = "data/components"
+trusted_component_hashes = [
+  # tdx_appraiser.wasm
+  "bca24729b16c72f72f4e08a483dbad4795407da4fc08b6f97303301f8e9b6137",
+]
+
+
+[ear]
+signing_key_path = "config/keys/ear_signing.pem"
+
+# TDX policy：
+# - pccs_url: verifier host fetches collateral by fmspc. Default is Intel public network; change to internal PCCS.
+# - trusted_*_hex left empty = full chain verification in wasm + nonce binding only, no measurement comparison (demo)
+[policy.tdx]
+pccs_url = "https://api.trustedservices.intel.com"
+trusted_mr_td_hex = []
+trusted_mr_seam_hex = []
+trusted_mr_config_id_hex = []
+accept_tcb_status = []

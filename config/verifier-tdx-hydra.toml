@@ -1,0 +1,30 @@
+listen = "127.0.0.1:8080"
+
+[wasm]
+allow_unsigned = false
+registry_dir = "data/components"
+trusted_component_hashes = [
+  # tdx_hydra_appraiser.wasm
+  "3a4ca627fc39b8476b1d694b3032e5a20f12c92cfe9aea947ab80fb02419cbb0",
+]
+
+
+[ear]
+signing_key_path = "config/keys/ear_signing.pem"
+
+# TDX + hydra dual-layer policy. Evidence is rejected if either layer fails.
+# trusted_*_hex left empty = chain verification + nonce binding only.
+# trusted_roots_hex source: cargo run -p hydra --example shrubs_roots
+[policy.tdx]
+pccs_url = "https://api.trustedservices.intel.com"
+trusted_mr_td_hex = []
+trusted_mr_seam_hex = []
+trusted_mr_config_id_hex = []
+accept_tcb_status = []
+
+[policy.hydra]
+trusted_roots_hex = [
+  "24ad36ee559e14bd5696a38a257fce71a0db629c1b30058c43e11239a8f2e109",
+  "df0bcf2b96d94278b119985e07cfa897b1a2702a6ff51c50c2e1a27e7a0bfe19",
+  "ff3cfdb72b8593831f3c0619a255be205467dd2755827fb92bdd6185873c2f0d",
+]

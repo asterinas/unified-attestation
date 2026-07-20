@@ -1,0 +1,24 @@
+package unified-attestation:verifier;
+
+interface verifier-interface {
+  variant optional-data {
+    value(list<u8>),
+    not-provided,
+  }
+
+  type report-data = optional-data;
+  type init-data-hash = optional-data;
+
+  resource verifier {
+    constructor();
+    evaluate: func(
+      evidence: list<u8>,
+      expected-report-data: report-data,
+      expected-init-data-hash: init-data-hash,
+    ) -> string;
+  }
+}
+
+world verifier {
+  export verifier-interface;
+}

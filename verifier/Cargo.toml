@@ -1,12 +1,36 @@
 [package]
 name = "verifier"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+base64.workspace = true
+ccatoken.workspace = true
+clap.workspace = true
+codicon = "3"
+csv-rs = { git = "https://github.com/openanolis/csv-rs", rev = "b67a07e", default-features = false, features = ["network"] }
+# Host-side TDX collateral fetch: report feature exposes collateral::get_collateral
+dcap-qvl = { version = "0.3.6", default-features = false, features = ["std", "report"] }
+ear.workspace = true
+hex.workspace = true
+jsonwebtoken.workspace = true
+prost.workspace = true
+protos = { path = "../protos" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 hydra-toolkit = { path = "../hydra-toolkit" }
-anyhow = "1.0.62"
-tokio = { version = "1", features = ["full"] }
-rayon = "1.11.0"
-chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.11"
 k256 = { version = "0.13", features = ["ecdsa", "ecdh", "sha256"] }
+ureq = "2"
+uuid.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true

@@ -1,14 +1,26 @@
+//! Shrubs accumulator: a space-efficient Merkle-like tree where only "root" nodes are
+//! stored rather than every internal node. Insertion and Merkle path lookup are structural:
+//! they depend on leaf ordering and total leaf count, not on hash values.
+//!
+//! Key properties:
+//! - The root list after each batch is the public commitment (sent in PublicContext).
+//! - `find_shrubs_path` returns (siblings, direction_tags) for a given leaf; `None` if the
+//!   leaf is itself a root boundary node.
+//! - `affected_indices` computes which old attesters need path recalculation after insert.
+
 use ark_bls12_381::Fr as BlsScalar;
 use arkworks_native_gadgets::poseidon::{FieldHasher, Poseidon};
 use rayon::prelude::*;
 
+/// Internal node representing a sub-tree root span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Root {
     level: u32,
-    left: usize,
-    right: usize,
+    left: usize,   // 1-based
+    right: usize,  // 1-based
 }
 
+/// Find the shrubs root that "owns" a given 1-based leaf index.
 fn find_owner_root(index: usize, total: usize) -> Root {
     assert!(index >= 1 && index <= total);
 
@@ -69,16 +81,25 @@ pub fn affected_indices(old_total: usize, inserted: usize) -> Vec<usize> {
     affected
 }
 
+/// Decompose an integer into the set of powers-of-two that sum to it.
+/// E.g. `6 → [1, 2]` (2¹ + 2²). Used by `insert_shrubs_tree` to determine
+/// which levels of the tree need root insertion.
 pub fn exponents_of_two(mut x: usize) -> Vec<isize> {
     let mut exps = Vec::with_capacity(x.count_ones() as usize);
     while x != 0 {
-        let tz = x.trailing_zeros(); // 当前最低位1所在的指数
+        let tz = x.trailing_zeros();
         exps.push(tz as isize);
-        x &= x - 1; // 清除最低位的1
+        x &= x - 1;
     }
     exps
 }
 
+/// Recursively insert a batch of leaves into an existing shrubs tree.
+///
+/// `t_root` is mutated in place. `k` tracks the current level offset,
+/// `exps` is the exponents-of-two decomposition of the old leaf count,
+/// `ll` indexes into `exps` to decide when to insert a root node from the
+/// previous level. The recursion bottoms out when no more pairs can be hashed.
 pub fn insert_shrubs_tree(
     t_root: &mut Vec<BlsScalar>,
     vect: &[BlsScalar],
@@ -87,10 +108,6 @@ pub fn insert_shrubs_tree(
     mut ll: usize,
     hasher: &Poseidon<BlsScalar>,
 ) {
-    // for i in vect.iter() {
-    //     println!("leaves: {}", i);
-    // }
-    println!("***********");
     let should_insert_root = ll < exps.len() && k + 2 == exps[ll];
 
     let mut temp = Vec::with_capacity(vect.len() / 2 + if should_insert_root { 1 } else { 0 });
@@ -114,11 +131,11 @@ pub fn insert_shrubs_tree(
 
     temp.extend(results);
 
-    let last_i = vect.len() - if vect.len() % 2 == 0 { 2 } else { 1 };
+    let last_i = vect.len() - if vect.len().is_multiple_of(2) { 2 } else { 1 };
 
     k += 1;
 
-    if t_root.len() - 1 >= k as usize {
+    if t_root.len() > k as usize {
         t_root[k as usize] = vect[last_i];
     } else {
         t_root.push(vect[last_i]);
@@ -129,6 +146,9 @@ pub fn insert_shrubs_tree(
     }
 }
 
+/// Build a shrubs tree from scratch for the initial batch of leaves.
+/// Pairs are hashed in parallel via rayon; odd leaves are pushed as roots.
+/// The resulting `root` list is the public commitment inserted into PublicContext.
 pub fn create_batch_devices(
     root: &mut Vec<BlsScalar>,
     leaves: &[BlsScalar],
@@ -140,12 +160,6 @@ pub fn create_batch_devices(
         return;
     }
 
-    // for i in leaves.iter() {
-    //     println!("leaves: {}", i);
-    // }
-
-    // println!("------------");
-
     let temp: Vec<BlsScalar> = leaves
         .par_chunks(2)
         .filter(|chunk| chunk.len() == 2)
@@ -157,7 +171,11 @@ pub fn create_batch_devices(
         })
         .collect();
 
-    let last_i = if len % 2 == 0 { len - 2 } else { len - 1 };
+    let last_i = if len.is_multiple_of(2) {
+        len - 2
+    } else {
+        len - 1
+    };
 
     root.push(leaves[last_i]);
 
@@ -166,46 +184,12 @@ pub fn create_batch_devices(
     }
 }
 
-pub fn find_shrubs_path_test(
-    root: &[BlsScalar],
-    leaves: &[BlsScalar],
-    mut j: usize,
-    value: usize,
-    mut path: &mut Vec<BlsScalar>,
-    mut index: &mut Vec<bool>,
-    hasher: &Poseidon<BlsScalar>,
-) {
-    if value % 2 == 1 {
-        index.push(false);
-        path.push(leaves[value - 1]);
-    } else {
-        index.push(true);
-        path.push(leaves[value + 1]);
-    }
-
-    let temp: Vec<BlsScalar> = leaves
-        .par_chunks(2)
-        .filter(|chunk| chunk.len() == 2)
-        .map(|chunk| {
-            let a = chunk[0];
-            let b = chunk[1];
-
-            hasher.hash(&[a, b][..]).unwrap()
-        })
-        .collect();
-
-    if temp.len() >= 2 {
-        let val = value / 2;
-        j += 1;
-
-        if temp[val] == root[j] {
-            return;
-        }
-
-        find_shrubs_path_test(root, &temp, j, val, &mut path, &mut index, hasher);
-    }
-}
-
+/// Calculate the Merkle proof path and direction tags for a leaf at `value`.
+///
+/// Returns `(sibling_values, direction_tags)` where `direction_tags[i] = true` means
+/// the sibling was on the right (leaf was left child). Returns `None` when the leaf
+/// itself is a shrubs root boundary node — such leaves have no path and cannot
+/// participate in the circuit for this batch.
 pub fn find_shrubs_path(
     root: &[BlsScalar],
     leaves: &[BlsScalar],
@@ -269,37 +253,6 @@ pub fn find_shrubs_path(
     Some((path, index))
 }
 
-pub fn find_merkle_path(
-    leaves: &[BlsScalar],
-    value: usize,
-    mut path: &mut Vec<BlsScalar>,
-    mut index: &mut Vec<bool>,
-    hasher: &Poseidon<BlsScalar>,
-) {
-    if value % 2 == 1 {
-        index.push(false);
-        path.push(leaves[value - 1]);
-    } else {
-        index.push(true);
-        path.push(leaves[value + 1]);
-    }
-
-    let temp: Vec<BlsScalar> = leaves
-        .par_chunks(2)
-        .filter(|chunk| chunk.len() == 2)
-        .map(|chunk| {
-            let a = chunk[0];
-            let b = chunk[1];
-            hasher.hash(&[a, b][..]).unwrap()
-        })
-        .collect();
-
-    if temp.len() >= 2 {
-        let val = value / 2;
-        find_merkle_path(&temp, val, &mut path, &mut index, hasher);
-    }
-}
-
 fn largest_power_two_leq(n: usize) -> usize {
     assert!(n > 0);
 
@@ -312,6 +265,9 @@ fn largest_power_two_leq(n: usize) -> usize {
     p
 }
 
+/// Binary-search a leaf value in the sorted shrubs leaf list. Returns the owning
+/// subtree's leaf slice and the local index of the target within that slice.
+/// `None` when the leaf is not present.
 pub fn find_interval_index(
     arr: &[BlsScalar],
     target: &BlsScalar,
@@ -346,39 +302,6 @@ pub fn find_interval_index(
     }
 
     None
-}
-
-fn _insert_single_decive(
-    leaf: BlsScalar,
-    mut next_index: usize,
-    root: &mut Vec<BlsScalar>,
-    hasher: &Poseidon<BlsScalar>,
-) -> usize {
-    let _leaf_index = next_index;
-    let mut current_index = next_index;
-    next_index = next_index + 1;
-
-    let mut current_level_hash = leaf;
-
-    for i in 0..=root.len() {
-        if current_index % 2 == 0 {
-            if i == root.len() {
-                root.push(current_level_hash);
-            } else {
-                root[i] = current_level_hash;
-            }
-
-            break;
-        } else {
-            let left = root[i];
-            let right = current_level_hash;
-
-            current_level_hash = hasher.hash(&[left, right][..]).unwrap();
-            current_index = current_index / 2;
-        }
-    }
-
-    return next_index;
 }
 
 #[cfg(test)]

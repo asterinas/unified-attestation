@@ -1,15 +1,68 @@
-
 [workspace]
+resolver = "3"
 members = [
-    "attester",
+    "protos",
     "verifier",
+    "attester",
     "relying-party",
     "hydra-toolkit",
-     "tee-evidence",
-     "evidence-verify",
+    "appraisers/mock",
+    "appraisers/cca",
+    "appraisers/cca-hydra",
+    "appraisers/csv",
+    "appraisers/csv-hydra",
+    "appraisers/tdx",
+    "appraisers/tdx-hydra",
+    "appraisers/itrustee",
+    "appraisers/itrustee-hydra",
+    "appraisers/virtcca",
+    "appraisers/virtcca-hydra",
 ]
-resolver = "3"
+# `cargo build` (without -p / --workspace) compiles only host binaries;
+# wasm components are built explicitly via `cargo component build -p <appraiser>`.
+default-members = [
+    "protos",
+    "verifier",
+    "attester",
+    "relying-party",
+    "hydra-toolkit",
+]
 
-
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ear = "0.4.0"
+hex = "0.4"
+hmac = "0.12"
+jsonwebtoken = "9"
+prost = "0.13"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tonic = { version = "0.12", features = ["transport"] }
+tonic-build = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+wasmtime = { version = "41", features = ["component-model"] }
+wasmtime-wasi = "41"
+wit-bindgen = "0.46"
+
+# CCA host-side signature verification (rust-ccatoken 0.1 not published to crates.io)
+ccatoken = { git = "https://github.com/veraison/rust-ccatoken", rev = "6d5b8db" }
+# TDX wasm signature verification + host-side fmspc parsing / collateral fetch
+dcap-qvl = { version = "0.3.6", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "now"] }
+

@@ -50,6 +50,10 @@ fn proof_timestamp_period_signing_bytes(
     Ok(out)
 }
 
+/// Verify the verifier's authorization signature embedded in the EvidenceReply.
+/// Message: `(attester_pk, authorized_infor, timestamp, period)` — the same format
+/// produced by `verifier_compute_sig`. This proves the verifier endorsed this device
+/// at this time window.
 pub fn rely_party_verifier_sig(evidence_reply: &EvidenceReply, verifier_pk: &VerifyingKey) {
     let mut msg = Vec::new();
     msg.extend_from_slice(evidence_reply.pk.to_encoded_point(true).as_bytes());
@@ -66,6 +70,16 @@ pub fn rely_party_verifier_sig(evidence_reply: &EvidenceReply, verifier_pk: &Ver
     }
 }
 
+/// Full hydra evidence verification on the relying-party side.
+///
+/// Three checks in order:
+/// 1. Attester signature over the whole EvidenceReply (proves attester generated it).
+/// 2. Verifier authorization signature over (pk, authorized_infor, timestamp, period)
+///    (proves the verifier endorsed this device at this time).
+/// 3. Groth16::verify with public inputs [pk, root[..], authorized_infor, timestamp, period]
+///    (proves the device is in the shrubs whitelist without revealing its position).
+///
+/// Returns `Ok(true)` if all checks pass.
 pub fn rely_party_verification(
     root: &[hydra_toolkit::BlsScalar],
     evidence_reply: &EvidenceReply,
@@ -78,6 +92,11 @@ pub fn rely_party_verification(
         .to_signing_bytes_all_fields()
         .expect("serialize EvidenceReply failed");
 
+    // The attester signature and verifier signature are already verified by the
+    // hydra_listener caller before entering this function. Here we re-check them
+    // only for diagnostic println output — the return value depends solely on
+    // Groth16::verify. If the caller hasn't pre-checked, failures here will be
+    // printed but NOT reflected in the return value.
     match evidence_reply.pk.verify(&msg[..], &signature) {
         Ok(_) => println!("attester EvidenceReply signature verified"),
         Err(e) => println!(
@@ -88,6 +107,9 @@ pub fn rely_party_verification(
 
     rely_party_verifier_sig(evidence_reply, verifier_pk);
 
+    // The decisive check: Groth16 proof verification against the public inputs.
+    // This is the mathematically binding step that proves the device is in the
+    // shrubs whitelist without revealing its index.
     let res = match GrothSetup::verify(&evidence_reply.vk, &public_inputs, &evidence_reply.proof) {
         Ok(res) => res,
         Err(err) => {
@@ -116,6 +138,9 @@ pub fn rely_party_verification(
     Ok(res)
 }
 
+/// Verify that the attester signed this EvidenceReply with its own key.
+/// The signed message is the deterministic `to_signing_bytes_all_fields()` output,
+/// which covers every field of the EvidenceReply. This prevents replay or tampering.
 pub fn verify_evidence_reply_attester_signature(
     evidence_reply: &EvidenceReply,
     signature: &Signature,
@@ -129,6 +154,9 @@ pub fn verify_evidence_reply_attester_signature(
         .context("attester EvidenceReply signature verification failed")
 }
 
+/// Check that the attester's timestamp+period has not expired.
+/// The attester stamps its own wall-clock time when generating the EvidenceReply;
+/// the RP rejects stale evidence to prevent long-delayed replay.
 pub fn verify_evidence_reply_attester_freshness(evidence_reply: &EvidenceReply) -> Result<()> {
     let expires_at = evidence_reply
         .timestamp_attester
@@ -147,6 +175,9 @@ pub fn verify_evidence_reply_attester_freshness(evidence_reply: &EvidenceReply) 
     }
 }
 
+/// Verify the attester's proof-freshness signature: the attester signs
+/// `(proof, timestamp_attester, period_attester)` to prove the Groth16 proof
+/// was generated recently, not replayed from an old session.
 pub fn verify_evidence_reply_proof_timestamp_period_signature(
     evidence_reply: &EvidenceReply,
 ) -> Result<()> {

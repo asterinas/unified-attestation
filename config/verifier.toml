@@ -1,0 +1,18 @@
+listen = "127.0.0.1:8080"
+
+[wasm]
+# allow_unsigned defaults to false (ADR 0011). Must remain false in production.
+# Only set to true during local development when rapid iteration without signing is needed.
+allow_unsigned = false
+# allow_unsigned defaults to false (ADR 0011). Must remain false in production.
+# Only set to true during local development when rapid iteration without signing is needed.
+#   sha256sum target/wasm32-wasip1/release/*.wasm
+# Trusted component sha256 hashes (lowercase hex). After building new components, update with:
+#   sha256sum target/wasm32-wasip1/release/*.wasm
+# and paste the results here.
+  "dfcfc162517558ca844bd6e26d5ea328ccb0ee8490f9bc5606912296c61a8222",
+]
+
+
+[ear]
+signing_key_path = "config/keys/ear_signing.pem"
